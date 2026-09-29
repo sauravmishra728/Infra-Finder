@@ -1,11 +1,13 @@
-import React, { useState } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { 
   Calendar, 
   ChevronDown, 
   X, 
   BookmarkPlus, 
   Filter,
-  Check
+  Check,
+  Tag,
+  Hash
 } from 'lucide-react';
 import { DateFilterOption, DateTarget, FileCategory, SearchFilters } from '../types';
 
@@ -15,6 +17,7 @@ interface FilterBarProps {
   onResetFilters: () => void;
   onSaveSearchClick: () => void;
   categoryCounts: Record<FileCategory, number>;
+  tagCounts?: Record<string, number>;
 }
 
 export const FilterBar: React.FC<FilterBarProps> = ({
@@ -23,11 +26,29 @@ export const FilterBar: React.FC<FilterBarProps> = ({
   onResetFilters,
   onSaveSearchClick,
   categoryCounts,
+  tagCounts = {},
 }) => {
   const [showDateDropdown, setShowDateDropdown] = useState(false);
+  const [showTagDropdown, setShowTagDropdown] = useState(false);
   const [showCustomRangeModal, setShowCustomRangeModal] = useState(false);
   const [customStart, setCustomStart] = useState(filters.customStartDate || '');
   const [customEnd, setCustomEnd] = useState(filters.customEndDate || '');
+
+  const dateDropdownRef = useRef<HTMLDivElement>(null);
+  const tagDropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleOutside = (e: MouseEvent) => {
+      if (dateDropdownRef.current && !dateDropdownRef.current.contains(e.target as Node)) {
+        setShowDateDropdown(false);
+      }
+      if (tagDropdownRef.current && !tagDropdownRef.current.contains(e.target as Node)) {
+        setShowTagDropdown(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, []);
 
   const categories: { key: FileCategory; label: string; extLabel: string }[] = [
     { key: 'all', label: 'ALL', extLabel: 'All types' },
@@ -52,6 +73,20 @@ export const FilterBar: React.FC<FilterBarProps> = ({
     { key: 'custom', label: 'Custom Range...' },
   ];
 
+  // Standard preset tags + any discovered custom tags
+  const standardTags = ['Approved', 'Urgent', 'Draft', 'In Review', 'Archived'];
+  const allDiscoveredTags = Array.from(new Set([...standardTags, ...Object.keys(tagCounts)]));
+
+  const getTagDot = (tagName: string) => {
+    const lower = tagName.toLowerCase();
+    if (lower === 'approved') return 'bg-emerald-500';
+    if (lower === 'urgent') return 'bg-rose-500';
+    if (lower === 'draft') return 'bg-amber-500';
+    if (lower === 'in review') return 'bg-blue-500';
+    if (lower === 'archived') return 'bg-slate-400';
+    return 'bg-indigo-500';
+  };
+
   const getDateLabel = (opt: DateFilterOption) => {
     if (opt === 'custom' && filters.customStartDate && filters.customEndDate) {
       return `${filters.customStartDate} to ${filters.customEndDate}`;
@@ -73,6 +108,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
     Boolean(filters.query.trim()) ||
     filters.category !== 'all' ||
     filters.dateRange !== 'any' ||
+    Boolean(filters.selectedTag) ||
     (Boolean(filters.locationPath) && !['C:', 'D:', 'E:'].includes(filters.locationPath || ''));
 
   return (
@@ -178,6 +214,117 @@ export const FilterBar: React.FC<FilterBarProps> = ({
             )}
           </div>
 
+          {/* Tag Filter Dropdown */}
+          <div className="relative" ref={tagDropdownRef}>
+            <button
+              onClick={() => setShowTagDropdown(!showTagDropdown)}
+              className={`h-8 px-2.5 text-xs font-medium border rounded-md flex items-center gap-1.5 transition-colors ${
+                filters.selectedTag
+                  ? 'bg-indigo-50 dark:bg-indigo-950/60 border-indigo-400 dark:border-indigo-600 text-indigo-700 dark:text-indigo-300 font-semibold shadow-xs'
+                  : 'bg-white dark:bg-[#1e2430] border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:border-slate-400'
+              }`}
+              title="Filter files by custom status or project tag"
+            >
+              <Tag className="w-3.5 h-3.5 text-indigo-500" />
+              <span>{filters.selectedTag ? `Tag: ${filters.selectedTag}` : 'All Tags'}</span>
+              <ChevronDown className="w-3 h-3 text-slate-400" />
+            </button>
+
+            {showTagDropdown && (
+              <div className="absolute right-0 top-full mt-1 w-64 bg-white dark:bg-[#1e2430] border border-slate-200 dark:border-slate-700 rounded-lg shadow-xl z-50 p-2 space-y-1 text-xs max-h-72 overflow-y-auto">
+                <div className="px-2 py-1 text-[11px] font-semibold text-slate-400 uppercase tracking-wider flex items-center justify-between">
+                  <span>Filter by Metadata Tag</span>
+                  {filters.selectedTag && (
+                    <button
+                      onClick={() => {
+                        onUpdateFilters({ selectedTag: undefined });
+                        setShowTagDropdown(false);
+                      }}
+                      className="text-red-500 hover:underline normal-case text-[10px]"
+                    >
+                      Clear
+                    </button>
+                  )}
+                </div>
+
+                <button
+                  onClick={() => {
+                    onUpdateFilters({ selectedTag: undefined });
+                    setShowTagDropdown(false);
+                  }}
+                  className={`w-full px-2.5 py-1.5 text-left flex items-center justify-between rounded hover:bg-slate-100 dark:hover:bg-slate-800 ${
+                    !filters.selectedTag ? 'text-blue-600 dark:text-blue-400 font-semibold bg-blue-50 dark:bg-blue-900/40' : 'text-slate-700 dark:text-slate-200'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-slate-400" />
+                    <span>All Tags (No Filter)</span>
+                  </div>
+                  {!filters.selectedTag && <Check className="w-3.5 h-3.5" />}
+                </button>
+
+                <div className="border-t border-slate-100 dark:border-slate-800 my-1"></div>
+
+                {allDiscoveredTags.map((tagName) => {
+                  const isSelected = filters.selectedTag?.toLowerCase() === tagName.toLowerCase();
+                  const count = tagCounts[tagName] || 0;
+                  return (
+                    <button
+                      key={tagName}
+                      onClick={() => {
+                        onUpdateFilters({ selectedTag: tagName });
+                        setShowTagDropdown(false);
+                      }}
+                      className={`w-full px-2.5 py-1.5 text-left flex items-center justify-between rounded hover:bg-slate-100 dark:hover:bg-slate-800 ${
+                        isSelected ? 'text-indigo-600 dark:text-indigo-400 font-semibold bg-indigo-50 dark:bg-indigo-950/40' : 'text-slate-700 dark:text-slate-200'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className={`w-2 h-2 rounded-full ${getTagDot(tagName)}`} />
+                        <span>{tagName}</span>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        {count > 0 && (
+                          <span className="text-[10px] font-mono font-tabular text-slate-400 bg-slate-100 dark:bg-slate-800 px-1 rounded">
+                            {count}
+                          </span>
+                        )}
+                        {isSelected && <Check className="w-3.5 h-3.5 text-indigo-600 dark:text-indigo-400" />}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* Multi-Word Keyword Match Option Toggle */}
+          <button
+            onClick={() => onUpdateFilters({ matchAllWords: filters.matchAllWords === false ? true : false })}
+            className={`h-8 px-2.5 text-xs font-medium border rounded-md flex items-center gap-1.5 transition-colors ${
+              filters.matchAllWords !== false
+                ? 'bg-blue-50 dark:bg-blue-950/60 border-blue-400 dark:border-blue-700 text-blue-700 dark:text-blue-300 font-semibold shadow-2xs'
+                : 'bg-white dark:bg-[#1e2430] border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:border-slate-400'
+            }`}
+            title={
+              filters.matchAllWords !== false
+                ? 'Match ALL Words (AND Mode): Only files containing every single typed word will appear in search results.'
+                : 'Match ANY Word (OR Mode): Files containing at least one searched word will appear.'
+            }
+          >
+            {filters.matchAllWords !== false ? (
+              <>
+                <Check className="w-3 h-3 text-blue-600 dark:text-blue-400" />
+                <span>Match ALL Words</span>
+              </>
+            ) : (
+              <>
+                <Hash className="w-3 h-3 text-slate-400" />
+                <span>Match ANY Word</span>
+              </>
+            )}
+          </button>
+
           {/* Save Search Button */}
           <button
             onClick={onSaveSearchClick}
@@ -188,6 +335,47 @@ export const FilterBar: React.FC<FilterBarProps> = ({
             <span className="hidden sm:inline">Save Search</span>
           </button>
         </div>
+      </div>
+
+      {/* Row 2: Quick Status & Project Tag Filter Bar */}
+      <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar text-xs py-0.5">
+        <span className="text-[11px] font-semibold text-slate-500 dark:text-slate-400 flex items-center gap-1 mr-0.5 shrink-0">
+          <Tag className="w-3 h-3 text-indigo-500" />
+          Tags:
+        </span>
+        <button
+          onClick={() => onUpdateFilters({ selectedTag: undefined })}
+          className={`px-2 py-0.5 rounded text-[11px] font-medium transition-colors shrink-0 ${
+            !filters.selectedTag
+              ? 'bg-slate-800 dark:bg-slate-200 text-white dark:text-slate-900 font-semibold'
+              : 'bg-slate-200/80 dark:bg-slate-800 text-slate-700 dark:text-slate-300 hover:bg-slate-300 dark:hover:bg-slate-700'
+          }`}
+        >
+          All
+        </button>
+        {allDiscoveredTags.slice(0, 8).map((tagName) => {
+          const isSelected = filters.selectedTag?.toLowerCase() === tagName.toLowerCase();
+          const count = tagCounts[tagName] || 0;
+          return (
+            <button
+              key={tagName}
+              onClick={() => onUpdateFilters({ selectedTag: isSelected ? undefined : tagName })}
+              className={`px-2 py-0.5 rounded text-[11px] font-medium border flex items-center gap-1 transition-colors shrink-0 ${
+                isSelected
+                  ? 'bg-indigo-600 text-white border-indigo-600 font-semibold shadow-2xs'
+                  : 'bg-white dark:bg-[#1f2633] border-slate-300 dark:border-slate-700 text-slate-700 dark:text-slate-300 hover:border-indigo-400'
+              }`}
+            >
+              <span className={`w-1.5 h-1.5 rounded-full ${isSelected ? 'bg-white' : getTagDot(tagName)}`} />
+              <span>{tagName}</span>
+              {count > 0 && (
+                <span className={`text-[10px] font-mono ${isSelected ? 'text-indigo-100' : 'text-slate-400'}`}>
+                  {count}
+                </span>
+              )}
+            </button>
+          );
+        })}
       </div>
 
       {/* Row 2: Active Filter Chips Bar */}
@@ -233,6 +421,35 @@ export const FilterBar: React.FC<FilterBarProps> = ({
               <button
                 onClick={() => onUpdateFilters({ dateRange: 'any' })}
                 className="hover:text-amber-950 dark:hover:text-white"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          )}
+
+          {/* Tag Filter Chip */}
+          {filters.selectedTag && (
+            <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/60 text-indigo-900 dark:text-indigo-200 font-medium">
+              <span className={`w-1.5 h-1.5 rounded-full ${getTagDot(filters.selectedTag)}`} />
+              <span>Tag: {filters.selectedTag}</span>
+              <button
+                onClick={() => onUpdateFilters({ selectedTag: undefined })}
+                className="hover:text-indigo-950 dark:hover:text-white"
+                title="Clear tag filter"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </span>
+          )}
+
+          {/* Multi-Word Mode Chip (if user switched to Broad OR mode) */}
+          {filters.matchAllWords === false && Boolean(filters.query.trim()) && (
+            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950/60 text-amber-800 dark:text-amber-200 font-medium">
+              <span>Mode: Match ANY Word</span>
+              <button
+                onClick={() => onUpdateFilters({ matchAllWords: true })}
+                className="hover:text-amber-950 dark:hover:text-white"
+                title="Switch to Match ALL Words (AND)"
               >
                 <X className="w-3 h-3" />
               </button>

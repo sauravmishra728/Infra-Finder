@@ -22,7 +22,25 @@ export class FastSearchEngine {
     this.records = [];
     this.recordsById.clear();
     for (const file of files) {
-      this.addOrUpdateFile(file);
+      const normName = file.name.toLowerCase();
+      const normPath = file.path.toLowerCase();
+      const normTags = (file.tags || []).map(t => t.toLowerCase());
+      const normContent = (file.contentFull || file.contentSnippet || '').toLowerCase();
+      const createdTime = new Date(file.createdDate).getTime() || 0;
+      const modifiedTime = new Date(file.modifiedDate).getTime() || 0;
+
+      const record: IndexRecord = {
+        file,
+        normName,
+        normPath,
+        normTags,
+        normContent,
+        createdTime,
+        modifiedTime,
+      };
+
+      this.records.push(record);
+      this.recordsById.set(file.id, record);
     }
   }
 
@@ -44,13 +62,13 @@ export class FastSearchEngine {
       modifiedTime,
     };
 
-    const existingIdx = this.records.findIndex(r => r.file.id === file.id);
-    if (existingIdx >= 0) {
-      this.records[existingIdx] = record;
+    const existing = this.recordsById.get(file.id);
+    if (existing) {
+      Object.assign(existing, record);
     } else {
       this.records.push(record);
+      this.recordsById.set(file.id, record);
     }
-    this.recordsById.set(file.id, record);
   }
 
   public removeFile(fileId: string): void {
@@ -114,7 +132,15 @@ export class FastSearchEngine {
         }
       }
 
-      // 4. Query Matching & Scoring
+      // 4. Tag Filter
+      if (filters.selectedTag && filters.selectedTag !== 'all' && filters.selectedTag.trim()) {
+        const targetTag = filters.selectedTag.trim().toLowerCase();
+        if (!record.normTags.some(t => t === targetTag)) {
+          continue;
+        }
+      }
+
+      // 5. Query Matching & Scoring
       let score = 0;
       let matchedSnippet: string | undefined;
       let matchType: SearchResult['matchType'] = 'filename';
@@ -126,14 +152,15 @@ export class FastSearchEngine {
         continue;
       }
 
-      // Exact phrase match
+      // Check exact phrase matches (enclosed in double quotes)
       let hasExactMatch = true;
       for (const phrase of exactMatches) {
         const inName = record.normName.includes(phrase);
         const inContent = record.normContent.includes(phrase);
         const inPath = record.normPath.includes(phrase);
+        const inTags = record.normTags.some(t => t.includes(phrase));
 
-        if (!inName && !inContent && !inPath) {
+        if (!inName && !inContent && !inPath && !inTags) {
           hasExactMatch = false;
           break;
         }
@@ -147,52 +174,69 @@ export class FastSearchEngine {
           }
         }
         if (inPath) score += 100;
+        if (inTags) score += 200;
       }
 
       if (exactMatches.length > 0 && !hasExactMatch) {
         continue;
       }
 
-      // Token matching
+      // Check tokenized keyboard words
+      const metadataStr = Object.values(record.file.metadata || {})
+        .join(' ')
+        .toLowerCase();
+
       let tokensMatched = 0;
       for (const token of tokens) {
         let tokenFound = false;
 
-        // Check file extension match e.g., "pdf"
+        // 1. Exact or partial file extension match e.g., "pdf", "xlsx", "dwg"
         if (record.file.extension.toLowerCase() === token) {
-          score += 150;
+          score += 250;
           tokenFound = true;
         }
 
-        // Exact name match
+        // 2. Exact or substring filename match
         if (record.normName === token || record.normName.startsWith(token + '.')) {
           score += 1000;
           tokenFound = true;
           matchType = 'filename';
         } else if (record.normName.includes(token)) {
-          score += 300;
+          score += 400;
           tokenFound = true;
           matchType = 'filename';
         }
 
-        // Tags
+        // 3. Status and Project Tags
         if (record.normTags.some(tag => tag.includes(token))) {
-          score += 200;
+          score += 250;
           tokenFound = true;
           if (matchType !== 'filename') matchType = 'tag';
         }
 
-        // Path
-        if (record.normPath.includes(token)) {
-          score += 80;
-          tokenFound = true;
-        }
-
-        // Content
-        if (record.normContent.includes(token)) {
-          score += 120;
+        // 4. Metadata values (Chainage, Package, Revision, etc.)
+        if (metadataStr.includes(token)) {
+          score += 200;
           tokenFound = true;
           if (matchType !== 'filename' && matchType !== 'tag') {
+            matchType = 'metadata';
+          }
+        }
+
+        // 5. Path / Folder structure
+        if (record.normPath.includes(token)) {
+          score += 100;
+          tokenFound = true;
+          if (matchType !== 'filename' && matchType !== 'tag' && matchType !== 'metadata') {
+            matchType = 'path';
+          }
+        }
+
+        // 6. In-Document text content
+        if (record.normContent.includes(token)) {
+          score += 150;
+          tokenFound = true;
+          if (matchType !== 'filename' && matchType !== 'tag' && matchType !== 'metadata') {
             matchType = 'content';
           }
           if (!matchedSnippet) {
@@ -205,16 +249,37 @@ export class FastSearchEngine {
         }
       }
 
-      // Must match either phrase or tokens
-      if (tokens.length > 0 && tokensMatched === 0 && exactMatches.length === 0) {
-        continue;
+      // Multi-word matching option (defaults to true: all words required)
+      const requireAllWords = filters.matchAllWords ?? true;
+
+      if (tokens.length > 0) {
+        if (requireAllWords) {
+          // STRICT AND LOGIC: Every single word searched must be found in the file!
+          if (tokensMatched < tokens.length) {
+            continue;
+          }
+        } else {
+          // OR LOGIC: At least one word must match
+          if (tokensMatched === 0 && exactMatches.length === 0) {
+            continue;
+          }
+        }
+      } else if (exactMatches.length === 0) {
+        // Fallback if no clean tokens or quotes (e.g. special characters): must match as contiguous string
+        const matchesQuery = record.normName.includes(queryLower) ||
+          record.normContent.includes(queryLower) ||
+          record.normPath.includes(queryLower) ||
+          metadataStr.includes(queryLower);
+        if (!matchesQuery) {
+          continue;
+        }
       }
 
-      // Full query as contiguous substring bonus
+      // Full query contiguous substring bonus
       if (record.normName.includes(queryLower)) {
-        score += 400;
+        score += 500;
       } else if (record.normContent.includes(queryLower)) {
-        score += 250;
+        score += 300;
         if (!matchedSnippet) {
           matchedSnippet = this.extractSnippet(record.file.contentFull || record.file.contentSnippet || '', queryLower);
         }
@@ -368,5 +433,20 @@ export class FastSearchEngine {
     if (end < text.length) snippet = snippet + '...';
 
     return snippet;
+  }
+
+  public getAllTagsWithCounts(): Record<string, number> {
+    const counts: Record<string, number> = {};
+    for (const record of this.records) {
+      if (record.file.tags && record.file.tags.length > 0) {
+        for (const tag of record.file.tags) {
+          const trimmed = tag.trim();
+          if (trimmed) {
+            counts[trimmed] = (counts[trimmed] || 0) + 1;
+          }
+        }
+      }
+    }
+    return counts;
   }
 }

@@ -14,7 +14,7 @@ import {
   PanelRight,
   FolderOpen
 } from 'lucide-react';
-import { ViewMode } from '../types';
+import { ViewMode, DragDropOperation } from '../types';
 
 interface AddressToolbarProps {
   currentPath: string;
@@ -30,6 +30,7 @@ interface AddressToolbarProps {
   onViewModeChange: (mode: ViewMode) => void;
   showPreviewPane: boolean;
   onTogglePreviewPane: () => void;
+  onDropOnBreadcrumb?: (targetPath: string, itemIds: string[], op: DragDropOperation) => void;
 }
 
 export const AddressToolbar: React.FC<AddressToolbarProps> = ({
@@ -46,10 +47,12 @@ export const AddressToolbar: React.FC<AddressToolbarProps> = ({
   onViewModeChange,
   showPreviewPane,
   onTogglePreviewPane,
+  onDropOnBreadcrumb,
 }) => {
   const [isEditing, setIsEditing] = useState(false);
   const [inputPath, setInputPath] = useState(currentPath);
   const [copied, setCopied] = useState(false);
+  const [dropHoverPath, setDropHoverPath] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -158,7 +161,40 @@ export const AddressToolbar: React.FC<AddressToolbarProps> = ({
                       e.stopPropagation();
                       onNavigatePath(partialPath);
                     }}
-                    className="flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300 transition-colors"
+                    onDragOver={(e) => {
+                      if (onDropOnBreadcrumb) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        e.dataTransfer.dropEffect = e.ctrlKey ? 'copy' : 'move';
+                        setDropHoverPath(partialPath);
+                      }
+                    }}
+                    onDragLeave={(e) => {
+                      e.preventDefault();
+                      if (dropHoverPath === partialPath) setDropHoverPath(null);
+                    }}
+                    onDrop={(e) => {
+                      if (onDropOnBreadcrumb) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setDropHoverPath(null);
+                        const raw = e.dataTransfer.getData('application/infra-files');
+                        if (raw) {
+                          try {
+                            const parsed = JSON.parse(raw);
+                            const op: DragDropOperation = e.ctrlKey ? 'copy' : (parsed.op || 'move');
+                            onDropOnBreadcrumb(partialPath, parsed.ids, op);
+                          } catch {
+                            // ignore
+                          }
+                        }
+                      }
+                    }}
+                    className={`flex items-center gap-1 px-1.5 py-0.5 rounded transition-all ${
+                      dropHoverPath === partialPath
+                        ? 'bg-blue-100 dark:bg-blue-900/60 ring-2 ring-blue-500 font-bold text-blue-700 dark:text-blue-300'
+                        : 'hover:bg-slate-200 dark:hover:bg-slate-700 text-slate-700 dark:text-slate-300'
+                    }`}
                   >
                     {isDrive ? (
                       <HardDrive className="w-3 h-3 text-blue-500" />

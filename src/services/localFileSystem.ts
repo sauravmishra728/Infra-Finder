@@ -1,4 +1,5 @@
-import { FileCategory, FileItem } from '../types';
+import { FileCategory, FileItem, DriveInfo } from '../types';
+import { generateImageThumbnail } from './thumbnailService';
 
 export function getFileCategory(extension: string): FileCategory {
   const ext = extension.toLowerCase().replace(/^\./, '');
@@ -47,111 +48,211 @@ export function formatDateShort(isoString: string): string {
   }
 }
 
+const IGNORED_NAMES = new Set([
+  '$recycle.bin',
+  '$sysreset',
+  'system volume information',
+  'node_modules',
+  '.git',
+  '.svn',
+  '.vscode',
+  'appdata',
+  'recovery',
+  'windows',
+  'program files',
+  'program files (x86)',
+]);
+
+export function isCrossOriginSubFrame(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true; // accessing window.top threw SecurityError, definitely cross-origin iframe!
+  }
+}
+
 /**
  * Reads user's local directory using the browser File System Access API
+ * Designed to handle massive directory structures (TB scale) with streaming batches
  */
 export async function pickAndIndexLocalDirectory(
-  onProgress?: (count: number, currentFolder: string) => void
-): Promise<{ files: FileItem[]; folderPath: string; folderName: string } | null> {
-  // Check if showDirectoryPicker is supported
-  if ('showDirectoryPicker' in window) {
+  onProgress?: (count: number, currentFolder: string) => void,
+  onBatchDiscovered?: (batch: FileItem[]) => void
+): Promise<{ files: FileItem[]; folderPath: string; folderName: string; driveLetter: string; dirHandle: any } | null> {
+  // If in an iframe, showDirectoryPicker is prohibited by browsers
+  if (isCrossOriginSubFrame()) {
+    return null;
+  }
+
+  if (typeof window !== 'undefined' && 'showDirectoryPicker' in window) {
     try {
-      // @ts-expect-error - standard browser API
+      // @ts-expect-error - Standard browser API
       const dirHandle = await window.showDirectoryPicker({
         mode: 'read',
       });
 
-      const rootName = dirHandle.name;
-      const virtualDrive = 'D:\\LocalImported\\' + rootName;
-      const discoveredFiles: FileItem[] = [];
-
-      let count = 0;
-
-      async function scanDir(
-        handle: any,
-        currentPath: string,
-        parentPath: string
-      ) {
-        // Add folder record
-        const folderId = 'local-dir-' + Math.random().toString(36).substring(2, 9);
-        const folderItem: FileItem = {
-          id: folderId,
-          name: handle.name,
-          extension: '',
-          path: currentPath,
-          parentPath: parentPath,
-          category: 'folder',
-          size: 0,
-          createdDate: new Date().toISOString(),
-          modifiedDate: new Date().toISOString(),
-          isFolder: true,
-          isLocalImported: true,
-        };
-        discoveredFiles.push(folderItem);
-
-        for await (const entry of handle.values()) {
-          count++;
-          if (onProgress && count % 5 === 0) {
-            onProgress(count, currentPath);
-          }
-
-          if (entry.kind === 'file') {
-            try {
-              const fileData = await entry.getFile();
-              const ext = fileData.name.includes('.') ? fileData.name.split('.').pop() || '' : '';
-              let textSnippet = '';
-
-              // Read sample text for small text-based files
-              if (['txt', 'csv', 'md', 'json', 'log', 'xml'].includes(ext.toLowerCase()) && fileData.size < 500000) {
-                try {
-                  const text = await fileData.text();
-                  textSnippet = text.slice(0, 500);
-                } catch {
-                  // ignore
-                }
-              }
-
-              const item: FileItem = {
-                id: 'local-file-' + Math.random().toString(36).substring(2, 9),
-                name: fileData.name,
-                extension: ext,
-                path: `${currentPath}\\${fileData.name}`,
-                parentPath: currentPath,
-                category: getFileCategory(ext),
-                size: fileData.size,
-                createdDate: new Date(fileData.lastModified).toISOString(),
-                modifiedDate: new Date(fileData.lastModified).toISOString(),
-                isFolder: false,
-                contentFull: textSnippet,
-                contentSnippet: textSnippet ? textSnippet.slice(0, 160) : undefined,
-                isLocalImported: true,
-              };
-
-              discoveredFiles.push(item);
-            } catch (err) {
-              console.warn('Skipping file due to read error:', err);
-            }
-          } else if (entry.kind === 'directory') {
-            await scanDir(entry, `${currentPath}\\${entry.name}`, currentPath);
-          }
-        }
-      }
-
-      await scanDir(dirHandle, virtualDrive, 'D:\\LocalImported');
-
-      return {
-        files: discoveredFiles,
-        folderPath: virtualDrive,
-        folderName: rootName,
-      };
-    } catch (err: any) {
-      if (err.name === 'AbortError') {
-        return null; // User cancelled
-      }
-      console.error('Directory read failed', err);
-      throw err;
+      return await scanDirectoryHandle(dirHandle, onProgress, onBatchDiscovered);
+    } catch {
+      // Any cancellation, SecurityError or permission denial -> return null safely to trigger HTML5 fallback
+      return null;
     }
   }
 
   return null;
+}
+
+export async function scanDirectoryHandle(
+  dirHandle: any,
+  onProgress?: (count: number, currentFolder: string) => void,
+  onBatchDiscovered?: (batch: FileItem[]) => void
+): Promise<{ files: FileItem[]; folderPath: string; folderName: string; driveLetter: string; dirHandle: any } | null> {
+  try {
+    const rootName = dirHandle.name;
+    // Derive clean Windows drive or path e.g. "D:\" or root name
+    let driveLetter = 'D:';
+    if (/^[a-zA-Z]:?$/.test(rootName)) {
+      driveLetter = rootName.toUpperCase().replace(/:$/, '') + ':';
+    } else if (rootName.toUpperCase().includes('C')) {
+      driveLetter = 'C:';
+    }
+
+    const rootPath = rootName.includes(':') ? `${rootName}\\` : `${driveLetter}\\${rootName}`;
+    const discoveredFiles: FileItem[] = [];
+    let pendingBatch: FileItem[] = [];
+    let count = 0;
+
+    async function scanDir(
+      handle: any,
+      currentPath: string,
+      parentPath: string
+    ) {
+      // Add folder record
+      const folderId = 'dir-' + Math.random().toString(36).substring(2, 9);
+      const folderItem: FileItem = {
+        id: folderId,
+        name: handle.name,
+        extension: '',
+        path: currentPath,
+        parentPath: parentPath,
+        category: 'folder',
+        size: 0,
+        createdDate: new Date().toISOString(),
+        modifiedDate: new Date().toISOString(),
+        isFolder: true,
+        isLocalImported: true,
+      };
+      discoveredFiles.push(folderItem);
+      pendingBatch.push(folderItem);
+
+      for await (const entry of handle.values()) {
+        const lowerName = entry.name.toLowerCase();
+        if (IGNORED_NAMES.has(lowerName) || lowerName.startsWith('$')) {
+          continue;
+        }
+
+        count++;
+        if (count % 40 === 0) {
+          if (onProgress) {
+            onProgress(count, currentPath);
+          }
+          // Cooperative yielding to prevent UI thread blocking on TB datasets
+          await new Promise((r) => setTimeout(r, 0));
+        }
+
+        if (entry.kind === 'file') {
+          try {
+            const fileData = await entry.getFile();
+            const ext = fileData.name.includes('.') ? fileData.name.split('.').pop() || '' : '';
+            const lowerExt = ext.toLowerCase();
+            let textSnippet = '';
+            let contentFull = '';
+            let thumbnailUrl: string | undefined = undefined;
+            let imageDimensions: { width: number; height: number } | undefined = undefined;
+
+            // 1. Text Content Extraction for .txt, .log, and plain text formats
+            if (['txt', 'log', 'csv', 'md', 'json', 'xml', 'ncr', 'boq', 'ini', 'cfg'].includes(lowerExt) && fileData.size < 2000000) {
+              try {
+                const text = await fileData.text();
+                contentFull = text;
+                textSnippet = text.slice(0, 200);
+              } catch {
+                // ignore read error
+              }
+            }
+
+            // 2. Thumbnail Generator for Images
+            if (['jpg', 'jpeg', 'png', 'bmp', 'webp', 'gif', 'svg'].includes(lowerExt) && fileData.size < 25000000) {
+              try {
+                const thumbResult = await generateImageThumbnail(fileData);
+                if (thumbResult) {
+                  thumbnailUrl = thumbResult.thumbnailUrl;
+                  imageDimensions = { width: thumbResult.width, height: thumbResult.height };
+                }
+              } catch {
+                // ignore image decode error
+              }
+            }
+
+            const item: FileItem = {
+              id: 'file-' + Math.random().toString(36).substring(2, 9),
+              name: fileData.name,
+              extension: ext,
+              path: `${currentPath}\\${fileData.name}`,
+              parentPath: currentPath,
+              category: getFileCategory(ext),
+              size: fileData.size,
+              createdDate: new Date(fileData.lastModified).toISOString(),
+              modifiedDate: new Date(fileData.lastModified).toISOString(),
+              isFolder: false,
+              contentFull: contentFull || textSnippet,
+              contentSnippet: textSnippet ? textSnippet.slice(0, 160) : undefined,
+              thumbnailUrl,
+              imageDimensions,
+              isLocalImported: true,
+            };
+
+            discoveredFiles.push(item);
+            pendingBatch.push(item);
+
+            if (pendingBatch.length >= 100) {
+              if (onBatchDiscovered) {
+                onBatchDiscovered([...pendingBatch]);
+              }
+              pendingBatch = [];
+            }
+          } catch (err) {
+            console.warn('Skipping file due to read error:', err);
+          }
+        } else if (entry.kind === 'directory') {
+          try {
+            await scanDir(entry, `${currentPath}\\${entry.name}`, currentPath);
+          } catch (err) {
+            console.warn('Skipping folder due to permissions:', err);
+          }
+        }
+      }
+    }
+
+    await scanDir(dirHandle, rootPath, driveLetter);
+
+    // Flush remaining batch
+    if (pendingBatch.length > 0 && onBatchDiscovered) {
+      onBatchDiscovered(pendingBatch);
+    }
+
+    return {
+      files: discoveredFiles,
+      folderPath: rootPath,
+      folderName: rootName,
+      driveLetter,
+      dirHandle,
+    };
+  } catch (err: any) {
+    if (err.name === 'AbortError') {
+      return null;
+    }
+    console.error('Directory scan failed', err);
+    throw err;
+  }
 }
